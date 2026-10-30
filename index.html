@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<title>Light Up the Gym</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;800&family=Atkinson+Hyperlegible:wght@400;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="root"><div class="wrap"><h1>Light up <span class="lit">the gym</span></h1><p class="lede">Loading the show…</p></div></div>
+<script src="qrcode.js"></script>
+<script src="engine.js"></script>
+<script>
+(function(){
+'use strict';
+var root=document.getElementById('root');
+var sched=[],sig='',loaded=false,loadFailed=false,raf=0,wake=null,stageOn=false;
+
+function load(){
+  return fetchLibrary().then(function(lib){var ns=JSON.stringify(lib);var changed=ns!==sig;sig=ns;sched=resolveStarts(lib);loaded=true;loadFailed=false;return changed})
+    .catch(function(){loadFailed=!loaded;return false});
+}
+function stopLoop(){if(raf)cancelAnimationFrame(raf);raf=0}
+function keepAwake(){try{if(navigator.wakeLock&&!wake)navigator.wakeLock.request('screen').then(function(w){wake=w;w.addEventListener('release',function(){wake=null})}).catch(function(){})}catch(e){}}
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&(stageOn||location.hash==='#screen'))keepAwake()});
+function whenText(item,prev){
+  if(prev&&item.show.after===prev.show.id)return'right after';
+  return fmtClock(item.start);
+}
+
+/* ---------- student view ---------- */
+function renderCrowd(){
+  stopLoop();stageOn=false;
+  var now=Date.now(),pk=pickShow(sched,now),cur=pk.cur;
+  var upcoming=sched.filter(function(x){return x.end>=now});
+  var section=LS.get('section',0),calmDefault=false;
+  try{calmDefault=matchMedia('(prefers-reduced-motion: reduce)').matches}catch(e){}
+  var calm=LS.get('calm',calmDefault);
+  var colours=cur?sectionHex(cur.show):sectionHex({});
+  var has=upcoming.length>0;
+  root.innerHTML='<div class="wrap">'
+    +'<h1>Light up <span class="lit">the gym</span></h1>'
+    +(loadFailed?'<p class="lede">The show couldn\'t load. Check your connection and refresh the page.</p>'
+      :has?'<p class="lede">Your screen flashes in time with the music, together with everyone else in the gym.</p>'
+      :'<p class="lede">No show is scheduled right now. Check back when your teacher tells you it\'s ready.</p>')
+    +(has?'<div class="panel"><div class="countdown" id="cd">–:––</div><p class="muted small" id="cdl"></p>'
+      +(upcoming.length>1?'<ol class="lineup">'+upcoming.map(function(x,i){return'<li>'+esc(x.show.name||songTitle(x.show.song)||'Song')+' <span class="muted">'+esc(whenText(x,upcoming[i-1]))+'</span></li>'}).join('')+'</ol>':'')
+      +'</div>':'')
+    +(has?'<div class="panel"><h2>Where are you sitting?</h2><p class="muted small">Pick the section your teacher gives you. Each section has its own colour.</p><div class="row" id="secs">'
+      +SECTIONS.map(function(x,i){return'<button class="chip" id="sec-'+x+'" aria-pressed="'+(i===section)+'" data-i="'+i+'"><i class="dot" style="background:'+esc(colours[i])+'"></i>Section '+x+'</button>'}).join('')
+      +'</div><div class="row"><button class="chip" id="calm" aria-pressed="'+calm+'">Calm mode: no flashing</button></div>'
+      +'<p class="muted small">Calm mode swaps flashes for slow colour fades. Use it if flashing lights bother you.</p></div>'
+      +'<button class="primary big" id="ready">I\'m ready</button>'
+      +'<div class="panel"><ol class="tips"><li>Turn your screen brightness all the way up.</li><li>Keep this page open and your phone unlocked.</li><li>Hold your phone up with the screen facing out.</li></ol></div>':'')
+    +'</div>';
+  if(!has)return;
+  root.querySelectorAll('#secs button').forEach(function(btn){btn.onclick=function(){section=+btn.dataset.i;LS.set('section',section);root.querySelectorAll('#secs button').forEach(function(x){x.setAttribute('aria-pressed',String(x===btn))})}});
+  var cb=document.getElementById('calm');cb.onclick=function(){calm=!calm;LS.set('calm',calm);cb.setAttribute('aria-pressed',String(calm))};
+  document.getElementById('ready').onclick=function(){openStage(section,calm)};
+  var cd=document.getElementById('cd'),cdl=document.getElementById('cdl');
+  (function tick(){
+    var n=Date.now(),p=pickShow(sched,n),c=p.cur;
+    if(!c){cd.textContent='–';cdl.textContent='';}
+    else if(p.state==='live'){cd.textContent='Live';cdl.textContent=(c.show.name||'The show')+' is on. Tap I\'m ready to join in.'}
+    else if(p.state==='waiting'){cd.textContent=fmtCount(c.start-n);cdl.textContent='until '+(c.show.name||'the music')+' starts'}
+    else{cd.textContent='Done';cdl.textContent='That show has finished.'}
+    raf=requestAnimationFrame(tick);
+  })();
+}
+function openStage(section,calm){
+  stopLoop();stageOn=true;keepAwake();
+  try{var de=document.documentElement;if(de.requestFullscreen)de.requestFullscreen().catch(function(){})}catch(e){}
+  var st=document.createElement('div');st.className='stage';
+  st.innerHTML='<button class="x" id="leave">Exit</button><div class="countdown" id="sc"></div><div class="sub" id="ss"></div>';
+  document.body.appendChild(st);
+  var sc=st.querySelector('#sc'),ss=st.querySelector('#ss'),last='';
+  st.querySelector('#leave').onclick=function(){stageOn=false;st.remove();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}if(wake){wake.release().catch(function(){});wake=null}document.body.style.background='';renderCrowd()};
+  (function loop(){
+    var n=Date.now(),p=pickShow(sched,n),c=p.cur,fr,label='',sub='';
+    if(!c||p.state==='done'){fr={rgb:[0,0,0]};label='That\'s a wrap';sub='Thanks for lighting up the gym.'}
+    else{
+      fr=frame(c.show,n-c.start,section,calm);
+      if(p.state==='waiting'&&c.start-n>4000){label=fmtCount(c.start-n);sub=(p.prev?'Next: ':'')+(c.show.name||'')+' · Section '+SECTIONS[section]+' · brightness up'}
+    }
+    document.body.style.background=st.style.background=rgbStr(fr.rgb);
+    if(label+sub!==last){sc.textContent=label;ss.textContent=sub;last=label+sub}
+    raf=requestAnimationFrame(loop);
+  })();
+}
+
+/* ---------- big screen for the projector ---------- */
+function renderScreen(){
+  stopLoop();keepAwake();
+  root.innerHTML='<div class="screen" id="scr"><canvas id="cv"></canvas>'
+    +'<div class="hud"><h1 id="hn"></h1><div class="t" id="ht"></div></div>'
+    +'<div class="join" id="join" hidden><div class="qr" id="qr"></div><div class="txt"><h2>Scan to join the light show</h2><div class="countdown" id="jc"></div><p id="jn"></p><p>Pick your section, turn your brightness up and tap I\'m ready.</p></div></div>'
+    +'<button class="fs" id="fs">Full screen</button></div>';
+  var scr=document.getElementById('scr'),cv=document.getElementById('cv'),g=cv.getContext('2d');
+  var join=document.getElementById('join'),hn=document.getElementById('hn'),ht=document.getElementById('ht'),jc=document.getElementById('jc'),jn=document.getElementById('jn');
+  var url=location.href.split('#')[0];
+  try{
+    var qr=qrcode(0,'M');qr.addData(url);qr.make();
+    var nm=qr.getModuleCount(),px=Math.max(2,Math.floor(Math.min(innerWidth,innerHeight)*0.45/nm)),qc=document.createElement('canvas');
+    qc.width=qc.height=nm*px;var qg=qc.getContext('2d');qg.fillStyle='#fff';qg.fillRect(0,0,qc.width,qc.height);qg.fillStyle='#000';
+    for(var yy=0;yy<nm;yy++)for(var xx=0;xx<nm;xx++)if(qr.isDark(yy,xx))qg.fillRect(xx*px,yy*px,px,px);
+    qc.setAttribute('role','img');qc.setAttribute('aria-label','QR code for '+url);document.getElementById('qr').appendChild(qc);
+  }catch(e){document.getElementById('qr').textContent=url}
+  document.getElementById('fs').onclick=function(){try{(scr.requestFullscreen||scr.webkitRequestFullscreen).call(scr)}catch(e){}};
+  var idle;function wake2(){scr.classList.remove('idle');clearTimeout(idle);idle=setTimeout(function(){scr.classList.add('idle')},2500)}
+  scr.onmousemove=wake2;wake2();
+  /* a crowd of phones: each section is a block of dots with small differences in timing and brightness */
+  var COLS=16,ROWS=9,dots=[];
+  for(var sct=0;sct<4;sct++)for(var r=0;r<ROWS;r++)for(var c=0;c<COLS;c++){
+    var h=(sct*977+r*131+c*29)%1000/1000,h2=(sct*313+r*71+c*197)%1000/1000;
+    dots.push({s:sct,r:r,c:c,jit:(h-0.5)*60,gain:0.7+0.3*h2,off:h2<0.07});
+  }
+  function size(){var d=window.devicePixelRatio||1;cv.width=Math.round(innerWidth*d);cv.height=Math.round(innerHeight*d);g.setTransform(d,0,0,d,0,0)}
+  size();window.onresize=size;
+  (function loop(){
+    var n=Date.now(),p=pickShow(sched,n),cur=p.cur,W=innerWidth,H=innerHeight;
+    var showJoin=!cur||p.state==='done'||(p.state==='waiting'&&!p.prev&&cur.start-n>8000);
+    join.hidden=!showJoin||!cur||p.state==='done';
+    g.fillStyle='#000';g.fillRect(0,0,W,H);
+    if(!cur){hn.textContent='No show scheduled';ht.textContent=''}
+    else if(p.state==='done'){hn.textContent='That\'s a wrap';ht.textContent=''}
+    else if(showJoin){hn.textContent='';ht.textContent='';jc.textContent=fmtCount(cur.start-n);jn.textContent=cur.show.name||''}
+    else{
+      hn.textContent=cur.show.name||'';
+      ht.textContent=p.state==='live'?fmtLen(n-cur.start):'Next in '+fmtCount(cur.start-n);
+      var top=H*0.22,bh=H*0.62,gap=W*0.025,bw=(W-gap*5)/4,cell=Math.min(bw/COLS,bh/ROWS),rad=cell*0.32;
+      for(var s=0;s<4;s++){
+        var x0=gap+s*(bw+gap),y0=top,base=frame(cur.show,n-cur.start,s,false).rgb;
+        var grd=g.createRadialGradient(x0+bw/2,y0+bh/2,0,x0+bw/2,y0+bh/2,bw*0.75);
+        grd.addColorStop(0,'rgba('+Math.round(base[0])+','+Math.round(base[1])+','+Math.round(base[2])+',0.35)');grd.addColorStop(1,'rgba(0,0,0,0)');
+        g.fillStyle=grd;g.fillRect(x0-bw*0.25,y0-bh*0.25,bw*1.5,bh*1.5);
+        g.fillStyle='#ffffffaa';g.font='800 '+Math.round(H*0.05)+'px "Big Shoulders Display",Impact,sans-serif';g.textAlign='center';
+        g.fillText(SECTIONS[s],x0+bw/2,y0+bh+H*0.08);
+      }
+      for(var i=0;i<dots.length;i++){
+        var d=dots[i],x=gap+d.s*(bw+gap)+(d.c+0.5)*(bw/COLS),y=top+(d.r+0.5)*(bh/ROWS);
+        var rgb=d.off?[8,8,10]:scale(frame(cur.show,n-cur.start+d.jit,d.s,false).rgb,d.gain);
+        g.fillStyle=rgbStr(rgb);g.beginPath();g.arc(x,y,rad,0,Math.PI*2);g.fill();
+      }
+    }
+    raf=requestAnimationFrame(loop);
+  })();
+}
+
+function route(){if(location.hash==='#screen')renderScreen();else if(!stageOn)renderCrowd()}
+window.addEventListener('hashchange',function(){if(document.querySelector('.stage'))return;route()});
+load().then(route);
+/* pick up schedule changes the teacher uploads, without a refresh */
+setInterval(function(){load().then(function(changed){if(changed&&!stageOn&&location.hash!=='#screen')renderCrowd()})},60000);
+})();
+</script>
+</body>
+</html>

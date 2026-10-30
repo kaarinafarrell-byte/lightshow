@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<meta name="robots" content="noindex,nofollow">
+<title>Show Setup</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;800&family=Atkinson+Hyperlegible:wght@400;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="root"><div class="gate"><h1>Show <span class="lit">setup</span></h1><p class="muted">Loading…</p></div></div>
+<script src="engine.js"></script>
+<script>
+(function(){
+'use strict';
+var root=document.getElementById('root');
+var SHOW_KEYS=['dur','bpm','period','beats','lvl','sec','blen','drops','kicks','kst'];
+var pub=null,lib=null,editing=null,bases={},buffers={},ctx=null,preview=null,run={armed:false,srcs:{}};
+function q(id){return document.getElementById(id)}
+function clone(o){return o?JSON.parse(JSON.stringify(o)):null}
+function showById(id){return lib.shows.filter(function(s){return s.id===id})[0]||null}
+function titleOf(s){return s.name||songTitle(s.song)||'Untitled show'}
+function dirty(){return !pub||JSON.stringify(pub)!==JSON.stringify(lib)}
+function saveDraft(){try{localStorage.setItem('draft',JSON.stringify(lib))}catch(e){}}
+function setMsg(el,cls,text){if(!el)return;el.hidden=!text;el.className='msg '+(cls||'');el.textContent=text||''}
+function ensureCtx(){if(!ctx){var AC=window.AudioContext||window.webkitAudioContext;ctx=new AC()}try{if(navigator.audioSession)navigator.audioSession.type='playback'}catch(e){}return ctx}
+function toLocalInput(ms){var d=new Date(ms),p=function(n){return String(n).padStart(2,'0')};return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes())}
+
+/* ---------- password (checked in the browser; the real lock is your GitHub account) ---------- */
+function hex(buf){return Array.prototype.map.call(new Uint8Array(buf),function(b){return b.toString(16).padStart(2,'0')}).join('')}
+function unhex(h){var a=new Uint8Array(h.length/2);for(var i=0;i<a.length;i++)a[i]=parseInt(h.substr(i*2,2),16);return a}
+function hashPw(pw,salt,iter){
+  return crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveBits'])
+    .then(function(k){return crypto.subtle.deriveBits({name:'PBKDF2',salt:unhex(salt),iterations:iter,hash:'SHA-256'},k,256)}).then(hex);
+}
+function makePw(pw){var salt=hex(crypto.getRandomValues(new Uint8Array(16))),iter=150000;return hashPw(pw,salt,iter).then(function(h){return{salt:salt,iter:iter,hash:h}})}
+function unlocked(pw){try{return sessionStorage.getItem('unlocked')===pw.hash}catch(e){return false}}
+function markUnlocked(pw){try{sessionStorage.setItem('unlocked',pw.hash)}catch(e){}}
+
+function renderGate(mode,pw){
+  var create=mode==='create';
+  root.innerHTML='<form class="gate" id="gf"><h1>Show <span class="lit">setup</span></h1>'
+    +(create?'<p class="muted">Create a password for this page. After you upload your first shows.json, everyone opening this page will need it.</p>':'<p class="muted">Enter the setup password.</p>')
+    +'<label class="f" for="pw1">Password<input type="password" id="pw1" autocomplete="'+(create?'new-password':'current-password')+'" required></label>'
+    +(create?'<label class="f" for="pw2">Type it again<input type="password" id="pw2" autocomplete="new-password" required></label>':'')
+    +'<button class="primary big" type="submit">'+(create?'Create password':'Open setup')+'</button><div class="msg" id="gm" hidden></div></form>';
+  q('pw1').focus();
+  q('gf').onsubmit=function(ev){
+    ev.preventDefault();var a=q('pw1').value,gm=q('gm');
+    if(!window.crypto||!crypto.subtle){setMsg(gm,'bad','Open this page from its https:// GitHub Pages address. The password check needs a secure page.');return}
+    if(create){
+      if(a.length<6){setMsg(gm,'bad','Use at least 6 characters.');return}
+      if(a!==q('pw2').value){setMsg(gm,'bad','The two passwords don\'t match.');return}
+      setMsg(gm,'','Saving…');
+      makePw(a).then(function(p){lib.pw=p;saveDraft();markUnlocked(p);renderMain()});
+    }else{
+      setMsg(gm,'','Checking…');
+      hashPw(a,pw.salt,pw.iter).then(function(h){if(h===pw.hash){markUnlocked(pw);renderMain()}else{setMsg(gm,'bad','That password isn\'t right.');q('pw1').select()}});
+    }
+  };
+}
+
+/* ---------- main page ---------- */
+function renderMain(){
+  root.innerHTML='<div class="wrap">'
+  +'<h1>Show <span class="lit">setup</span></h1>'
+  +'<p class="lede">Build a show for each song, then download shows.json and upload it to GitHub. Phones always follow the uploaded version.</p>'
+  +'<div id="banner"></div>'
+  +'<section class="panel"><h2><span class="n">1</span>Your shows</h2><div class="cards" id="cards"></div><div class="row"><button id="add">Add a show</button></div></section>'
+  +'<section class="panel" id="editor" hidden></section>'
+  +'<section class="panel"><h2><span class="n">2</span>Upload</h2>'
+  +'<button class="primary" id="dl">Download shows.json</button>'
+  +'<ol class="tips small"><li>On github.com, open your light show repository.</li><li>Tap <b>Add file</b>, then <b>Upload files</b>, and choose the shows.json you just downloaded.</li><li>Tap <b>Commit changes</b>. Phones pick up the new schedule within a couple of minutes.</li></ol>'
+  +'<div class="row"><button id="chk">Check my upload</button></div><div class="msg" id="upmsg" hidden></div>'
+  +'<details><summary class="small muted">Change password</summary><form id="cpf" class="panel" style="margin-top:10px"><label class="f" for="np1">New password<input type="password" id="np1" autocomplete="new-password"></label><label class="f" for="np2">Type it again<input type="password" id="np2" autocomplete="new-password"></label><button type="submit">Change password</button><div class="msg" id="cpm" hidden></div></form></details>'
+  +'</section>'
+  +'<section class="panel"><h2><span class="n">3</span>Run the show</h2><div id="run"></div></section>'
+  +'</div>';
+  q('add').onclick=function(){var s={id:'s'+Date.now().toString(36),name:'',song:'',start:null,after:null,palette:'custom',colors:DEFAULT_COLORS.slice(),mode:'mix'};lib.shows.push(s);saveDraft();editing=s.id;renderCards();renderEditor();renderBanner();q('editor').scrollIntoView({behavior:'smooth'})};
+  q('dl').onclick=download;
+  q('chk').onclick=function(){setMsg(q('upmsg'),'','Checking…');fetchLibrary().then(function(p){pub=p;renderBanner();renderRun();setMsg(q('upmsg'),dirty()?'warn':'good',dirty()?'The uploaded version doesn\'t match yet. GitHub can take a minute or two. Try again shortly.':'Your upload is live. Phones now have this schedule.')}).catch(function(){setMsg(q('upmsg'),'bad','Couldn\'t reach shows.json. Check that it\'s uploaded next to index.html.')})};
+  q('cpf').onsubmit=function(ev){ev.preventDefault();var a=q('np1').value;if(a.length<6){setMsg(q('cpm'),'bad','Use at least 6 characters.');return}if(a!==q('np2').value){setMsg(q('cpm'),'bad','The two passwords don\'t match.');return}
+    makePw(a).then(function(p){lib.pw=p;saveDraft();markUnlocked(p);renderBanner();setMsg(q('cpm'),'good','Password changed. Download and upload shows.json to make it take effect.');q('np1').value=q('np2').value=''})};
+  renderBanner();renderCards();renderEditor();renderRun();
+}
+function renderBanner(){
+  var b=q('banner');if(!b)return;
+  if(!dirty()){b.innerHTML='';return}
+  b.innerHTML='<div class="banner"><span>'+(pub?'You have changes that aren\'t uploaded yet. Phones still use the old schedule.':'No shows.json found online yet. Download it and upload it to GitHub.')+'</span>'
+    +'<span class="row"><button id="bdl">Download shows.json</button>'+(pub?'<button id="disc">Discard changes</button>':'')+'</span></div>';
+  q('bdl').onclick=download;
+  if(pub)q('disc').onclick=function(){var me=this;if(me.dataset.sure!=='1'){me.dataset.sure='1';me.textContent='Tap again to discard';me.classList.add('danger');return}lib=clone(pub);try{localStorage.removeItem('draft')}catch(e){}editing=null;renderMain()};
+}
+function download(){
+  var blob=new Blob([JSON.stringify(lib)],{type:'application/json'}),a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download='shows.json';document.body.appendChild(a);a.click();
+  setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1000);
+}
+function whenLabel(s){
+  if(s.after){var p=showById(s.after);return p?'Right after '+titleOf(p):'Not scheduled'}
+  return s.start?fmtClock(s.start)+(s.start<Date.now()?' (past)':''):'Not scheduled';
+}
+function renderCards(){
+  var el=q('cards');if(!el)return;
+  if(!lib.shows.length){el.innerHTML='<p class="muted">No shows yet. Add one to get started.</p>';return}
+  var sched=resolveStarts(lib),order={};sched.forEach(function(x,i){order[x.show.id]=i});
+  var list=lib.shows.slice().sort(function(a,b){var oa=order[a.id],ob=order[b.id];return(oa==null?1e9:oa)-(ob==null?1e9:ob)});
+  el.innerHTML=list.map(function(s){
+    var cols=sectionHex(s).map(function(c){return'<i class="dot" style="background:'+esc(c)+';margin-right:3px"></i>'}).join('');
+    return'<div class="card'+(s.id===editing?' editing':'')+'"><div class="info"><b>'+esc(titleOf(s))+'</b>'
+      +'<span class="meta">'+cols+' '+(s.beats?esc(songTitle(s.song))+' · '+fmtLen(s.dur)+' · '+esc(MODES[normMode(s.mode)]):'No song loaded yet')+'</span>'
+      +'<span class="meta">'+esc(whenLabel(s))+'</span></div>'
+      +'<button data-id="'+esc(s.id)+'">'+(s.id===editing?'Editing':'Edit')+'</button></div>';
+  }).join('');
+  el.querySelectorAll('button[data-id]').forEach(function(b){b.onclick=function(){stopPreview();editing=b.dataset.id;renderCards();renderEditor();q('editor').scrollIntoView({behavior:'smooth'})}});
+}
+
+/* ---------- editor for one show ---------- */
+function applyTune(s){var b=bases[s.id];if(!b)return;var r=retime(b.base,b.mul,b.nudge);SHOW_KEYS.forEach(function(k){s[k]=r[k]});s.bpm=Math.round(s.bpm*10)/10;s.period=Math.round(s.period*10)/10}
+function chainsTo(a,target){var seen=0;while(a&&seen++<50){if(a.id===target)return true;a=a.after?showById(a.after):null}return false}
+function drawTimeline(cv,s,cursor){
+  var dpr=window.devicePixelRatio||1,w=cv.clientWidth||600,h=cv.clientHeight||56;
+  if(cv.width!==Math.round(w*dpr)){cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr)}
+  var g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);g.fillStyle='#000';g.fillRect(0,0,w,h);
+  if(!s.beats)return;
+  var pal=sectionHex(s),X=function(ms){return ms/s.dur*w};
+  for(var i=0;i<s.beats.length;i++){
+    var x0=X(s.beats[i]),x1=i+1<s.beats.length?X(s.beats[i+1]):w,sc=s.sec[i];
+    if(sc==='h'){var lv=(s.lvl[i]||0)/9;g.fillStyle=pal[Math.floor(i/4)%4];g.globalAlpha=0.35+0.5*lv;g.fillRect(x0,h*(1-lv)*0.5,x1-x0+0.5,h-h*(1-lv)*0.5)}
+    else if(sc==='q'){g.fillStyle='#ffffff';g.globalAlpha=0.12;g.fillRect(x0,h*0.75,x1-x0+0.5,h*0.25)}
+    else{var p=+sc/9;g.fillStyle='#ffffff';g.globalAlpha=0.15+0.5*p;g.fillRect(x0,h*(1-p*0.8),x1-x0+0.5,h*p*0.8)}
+  }
+  g.globalAlpha=1;g.fillStyle='#ffffff';
+  (s.drops||[]).forEach(function(d){g.fillRect(X(d)-1.5,0,3,h)});
+  if(cursor!=null){g.fillStyle='#f2b33d';g.fillRect(X(cursor)-1,0,2,h)}
+}
+function renderEditor(){
+  var ed=q('editor');if(!ed)return;
+  var s=editing?showById(editing):null;
+  if(!s){ed.hidden=true;ed.innerHTML='';return}
+  ed.hidden=false;
+  var has=!!(s.beats&&s.sec),cols=colorsOf(s),mode=normMode(s.mode),others=lib.shows.filter(function(o){return o.id!==s.id&&!chainsTo(o,s.id)});
+  var when=s.after?'after':s.start?'time':'none';
+  ed.innerHTML='<h2>'+esc(titleOf(s))+'</h2>'
+  +'<label class="f" for="e-name">Show name<input type="text" id="e-name" placeholder="Pep rally" value="'+esc(s.name)+'"></label>'
+  +'<label class="f" for="e-file">Song file (MP3, M4A or WAV)<input type="file" id="e-file" accept="audio/*,.mp3,.m4a,.wav,.aac"></label>'
+  +'<div class="bar" id="e-pbar" hidden><i id="e-pfill"></i></div>'
+  +'<p class="muted small" id="e-song">'+(has?'Song: <b>'+esc(songTitle(s.song))+'</b> ('+fmtLen(s.dur)+'). Pick the file again to preview it or adjust the timing.':'Pick the song file. It stays on this device. Only the beat timings go into shows.json.')+'</p>'
+  +'<div class="stat" id="e-stats"'+(has?'':' hidden')+'><div><b id="e-bpm"></b><span>Beats per min</span></div><div><b id="e-nd"></b><span>Drops</span></div><div><b id="e-nk"></b><span>Hard hits</span></div><div><b id="e-len"></b><span>Length</span></div></div>'
+  +'<div class="timeline" id="e-tlw"'+(has?'':' hidden')+'><canvas id="e-tl" tabindex="0" aria-label="Song map. Tap a spot to preview from there."></canvas>'
+  +'<div class="legend"><span><i style="background:#fff;opacity:.6"></i>Build-up</span><span><i style="background:#fff"></i>Drop (explosion)</span><span><i style="background:var(--maple)"></i>Bass in</span></div></div>'
+  +'<div id="e-tune"'+(bases[s.id]?'':' hidden')+'><p class="muted small">If the flashes feel twice as fast or slow as the beat, fix it here. Nudge moves every flash earlier or later.</p>'
+  +'<div class="row"><button id="e-half">Half speed</button><button id="e-dbl">Double speed</button><button id="e-early">Nudge −20 ms</button><button id="e-late">Nudge +20 ms</button></div><p class="muted small" id="e-ti"></p></div>'
+  +'<label class="f">Colours</label><div class="row" id="e-pals">'+Object.keys(PALETTES).map(function(k){return'<button class="chip" data-k="'+k+'" aria-pressed="'+((s.palette||'custom')===k)+'">'+PALETTES[k].name+'</button>'}).join('')+'</div>'
+  +'<div class="colors" id="e-custom"'+((s.palette||'custom')==='custom'?'':' hidden')+'>'+[0,1,2,3].map(function(i){return'<label class="f" for="e-c'+i+'">Section '+SECTIONS[i]+'<input type="color" id="e-c'+i+'" value="'+esc(cols[i])+'"></label>'}).join('')+'</div>'
+  +'<div class="swatches" id="e-sw"'+((s.palette||'custom')==='custom'?' hidden':'')+'></div>'
+  +'<label class="f">Sections working together when the bass is in</label><div class="row" id="e-modes">'+Object.keys(MODES).map(function(k){return'<button class="chip" data-k="'+k+'" aria-pressed="'+(mode===k)+'">'+MODES[k]+'</button>'}).join('')+'</div>'
+  +'<p class="modeinfo" id="e-mi">'+esc(MODE_INFO[mode])+'</p>'
+  +'<label class="f">When it plays</label>'
+  +'<label class="radio"><input type="radio" name="e-when" value="time"'+(when==='time'?' checked':'')+'>At a set time</label>'
+  +'<div id="e-timew"'+(when==='time'?'':' hidden')+' class="row"><input type="datetime-local" id="e-when" value="'+toLocalInput(s.start||Math.ceil((Date.now()+15*60000)/300000)*300000)+'" style="flex:1 1 220px"><button id="e-in2">In 2 minutes</button><button id="e-in5">In 5 minutes</button></div>'
+  +'<label class="radio"><input type="radio" name="e-when" value="after"'+(when==='after'?' checked':'')+(others.length?'':' disabled')+'>Right after another show (3 second pause)</label>'
+  +'<div id="e-afterw"'+(when==='after'?'':' hidden')+'><select id="e-after">'+others.map(function(o){return'<option value="'+esc(o.id)+'"'+(o.id===s.after?' selected':'')+'>'+esc(titleOf(o))+'</option>'}).join('')+'</select></div>'
+  +'<label class="radio"><input type="radio" name="e-when" value="none"'+(when==='none'?' checked':'')+'>Not scheduled</label>'
+  +quadHTML('e-pv','Preview of all four sections')
+  +'<div class="row"><button id="e-pvb">Preview with music here</button><button id="e-pvd">Preview the first drop</button></div>'
+  +'<p class="muted small" id="e-pvh"></p>'
+  +'<div class="row"><button class="primary" id="e-done">Done</button><button class="danger" id="e-del">Delete show</button></div>';
+
+  function changed(){saveDraft();renderCards();renderBanner();renderRun()}
+  function refresh(){
+    var c=s,ok=!!(c.beats&&c.sec);q('e-stats').hidden=!ok;q('e-tlw').hidden=!ok;
+    if(ok){q('e-bpm').textContent=Math.round(c.bpm);q('e-nd').textContent=c.drops.length;q('e-nk').textContent=c.kst.filter(function(v){return v===9}).length;q('e-len').textContent=fmtLen(c.dur);drawTimeline(q('e-tl'),c,null)}
+    var b=bases[s.id];q('e-tune').hidden=!b;if(b)q('e-ti').textContent='Speed ×'+b.mul+', nudge '+(b.nudge>0?'+':'')+b.nudge+' ms';
+    var buf=buffers[s.song],can=ok&&!!buf;q('e-pvb').disabled=!can;q('e-pvd').disabled=!can||!c.drops.length;
+    q('e-pvh').textContent=ok&&!buf?'To preview with music, pick the song file above.':'';
+    q('e-sw').innerHTML=sectionHex(s).map(function(c2,i){return'<span><i style="background:'+esc(c2)+'"></i>Section '+SECTIONS[i]+'</span>'}).join('');
+  }
+  refresh();
+  q('e-name').oninput=function(){s.name=this.value;ed.querySelector('h2').textContent=titleOf(s);changed()};
+  q('e-file').onchange=function(){
+    var f=this.files&&this.files[0];if(!f)return;
+    var title=songTitle(f.name.replace(/\.[^.]+$/,''));
+    q('e-pbar').hidden=false;q('e-song').textContent='Listening for the beats, build-ups and drops…';
+    f.arrayBuffer().then(function(ab){return decode(ensureCtx(),ab)}).then(function(buf){
+      buffers[title]=buf;
+      if(s.beats&&!bases[s.id]&&Math.abs(buf.duration*1000-s.dur)<1500){ /* same song again: keep the saved timing, just enable preview and tuning */
+        buffers[s.song]=buf;
+        return analyze(buf,function(p){q('e-pfill').style.width=Math.round(p*100)+'%'}).then(function(base){
+          var ratio=s.period&&base.period?base.period/s.period:1,mul=ratio>1.5?2:ratio<0.75?0.5:1;
+          bases[s.id]={base:base,mul:mul,nudge:0};q('e-song').innerHTML='Song: <b>'+esc(songTitle(s.song))+'</b> loaded. Your saved timing is kept.';
+        });
+      }
+      return analyze(buf,function(p){q('e-pfill').style.width=Math.round(p*100)+'%'}).then(function(base){
+        bases[s.id]={base:base,mul:1,nudge:0};s.song=title;applyTune(s);if(!s.name){s.name=title;q('e-name').value=title}
+        q('e-song').innerHTML='Analysed <b>'+esc(title)+'</b>. Check the map, then preview it below.';changed();
+      });
+    }).catch(function(){q('e-song').textContent='That file couldn\'t be read. Try an MP3 or M4A file.'})
+    .then(function(){q('e-pbar').hidden=true;refresh();ed.querySelector('h2').textContent=titleOf(s)});
+  };
+  q('e-half').onclick=function(){var b=bases[s.id];b.mul=b.mul===2?1:0.5;applyTune(s);refresh();changed()};
+  q('e-dbl').onclick=function(){var b=bases[s.id];b.mul=b.mul===0.5?1:2;applyTune(s);refresh();changed()};
+  q('e-early').onclick=function(){bases[s.id].nudge-=20;applyTune(s);refresh();changed()};
+  q('e-late').onclick=function(){bases[s.id].nudge+=20;applyTune(s);refresh();changed()};
+  ed.querySelectorAll('#e-pals button').forEach(function(b){b.onclick=function(){s.palette=b.dataset.k;ed.querySelectorAll('#e-pals button').forEach(function(x){x.setAttribute('aria-pressed',String(x===b))});q('e-custom').hidden=s.palette!=='custom';q('e-sw').hidden=s.palette==='custom';refresh();changed()}});
+  [0,1,2,3].forEach(function(i){q('e-c'+i).oninput=function(){s.colors=[0,1,2,3].map(function(j){return q('e-c'+j).value});refresh();changed()}});
+  ed.querySelectorAll('#e-modes button').forEach(function(b){b.onclick=function(){s.mode=b.dataset.k;q('e-mi').textContent=MODE_INFO[s.mode];ed.querySelectorAll('#e-modes button').forEach(function(x){x.setAttribute('aria-pressed',String(x===b))});changed()}});
+  function setWhen(v){
+    q('e-timew').hidden=v!=='time';q('e-afterw').hidden=v!=='after';
+    if(v==='time'){s.after=null;var t=new Date(q('e-when').value).getTime();s.start=isNaN(t)?null:t}
+    else if(v==='after'){s.start=null;s.after=q('e-after').value||null}
+    else{s.start=null;s.after=null}
+    changed();
+  }
+  ed.querySelectorAll('input[name=e-when]').forEach(function(r){r.onchange=function(){setWhen(r.value)}});
+  q('e-when').onchange=function(){setWhen('time')};
+  q('e-after').onchange=function(){setWhen('after')};
+  q('e-in2').onclick=function(){q('e-when').value=toLocalInput(Date.now()+2*60000);s.after=null;s.start=Date.now()+2*60000;changed()};
+  q('e-in5').onclick=function(){q('e-when').value=toLocalInput(Date.now()+5*60000);s.after=null;s.start=Date.now()+5*60000;changed()};
+  q('e-pvb').onclick=function(){if(preview)stopPreview();else startPreview(s,0)};
+  q('e-pvd').onclick=function(){if(s.drops&&s.drops.length)startPreview(s,Math.max(0,s.drops[0]-8000))};
+  q('e-tl').onclick=function(ev){if(!s.beats||!buffers[s.song])return;var r=this.getBoundingClientRect();startPreview(s,(ev.clientX-r.left)/r.width*s.dur)};
+  q('e-done').onclick=function(){stopPreview();editing=null;renderCards();renderEditor()};
+  q('e-del').onclick=function(){
+    var me=this;if(me.dataset.sure!=='1'){me.dataset.sure='1';me.textContent='Tap again to delete';return}
+    stopPreview();lib.shows=lib.shows.filter(function(o){return o.id!==s.id});
+    lib.shows.forEach(function(o){if(o.after===s.id){o.after=null}});
+    editing=null;changed();renderEditor();
+  };
+}
+function startPreview(s,fromMs){
+  stopPreview();var buf=buffers[s.song];if(!buf)return;
+  var c=ensureCtx();c.resume();
+  var src=c.createBufferSource();src.buffer=buf;src.connect(c.destination);
+  var t0=c.currentTime+0.1,off=Math.max(0,fromMs/1000);src.start(t0,off);preview={src:src,t0:t0-off,s:s};
+  src.onended=function(){if(preview&&preview.src===src)stopPreview()};
+  var b=q('e-pvb');if(b)b.textContent='Stop preview';
+  (function loop(){if(!preview||preview.src!==src)return;var t=(c.currentTime-preview.t0-(c.outputLatency||0)-(c.baseLatency||0))*1000;
+    if(!paintQuad('e-pv',s,t)){stopPreview();return}var tl=q('e-tl');if(tl)drawTimeline(tl,s,t);requestAnimationFrame(loop)})();
+}
+function stopPreview(){if(preview){var p=preview;preview=null;try{p.src.stop()}catch(e){}}var b=q('e-pvb');if(b)b.textContent='Preview with music here';clearQuad('e-pv','Preview of all four sections')}
+
+/* ---------- run the show: music from this device, lights from everyone's clocks ---------- */
+function renderRun(){
+  var el=q('run');if(!el)return;
+  if(run.armed){updateRunList();return}
+  var sched=pub?resolveStarts(pub):[],now=Date.now(),up=sched.filter(function(x){return x.end>now});
+  var delay=LS.get('delay',0);
+  el.innerHTML=(dirty()?'<div class="msg warn">Phones follow the uploaded schedule below. Upload your changes first so the music and the lights match.</div>':'')
+    +(up.length?'<ol class="lineup" id="r-list"></ol>':'<p class="muted">Nothing is scheduled in the uploaded shows.json. Set a time for a show, then upload it.</p>')
+    +'<label class="f" for="r-files">Songs for playback (pick them all at once)<input type="file" id="r-files" multiple accept="audio/*,.mp3,.m4a,.wav,.aac"></label>'
+    +'<label class="f" for="r-delay">Speaker delay: <span id="r-dv">'+delay+' ms</span><input type="range" id="r-delay" min="0" max="500" step="10" value="'+delay+'"></label>'
+    +'<p class="muted small">Bluetooth speakers play late. If the flashes land before the beat, raise this until they line up.</p>'
+    +'<div class="row"><button class="primary" id="r-start"'+(up.length?'':' disabled')+'>Start</button><button id="r-stop" disabled>Stop music</button></div>'
+    +'<div class="msg" id="r-msg" hidden></div>'
+    +quadHTML('r-live','Phones will look like this')
+    +'<p class="small"><a href="index.html#screen" target="_blank" rel="noopener">Open the big screen for the projector</a> · <a href="index.html" target="_blank" rel="noopener">Open the student page</a></p>';
+  updateRunList();
+  q('r-delay').oninput=function(){LS.set('delay',+this.value);q('r-dv').textContent=this.value+' ms'};
+  q('r-files').onchange=function(){
+    var files=Array.prototype.slice.call(this.files||[]),m=q('r-msg');if(!files.length)return;
+    setMsg(m,'','Loading '+files.length+' song'+(files.length>1?'s':'')+'…');
+    var c=ensureCtx(),shows=pub?pub.shows:[];
+    files.reduce(function(pr,f){return pr.then(function(){
+      return f.arrayBuffer().then(function(ab){return decode(c,ab)}).then(function(buf){
+        var title=songTitle(f.name.replace(/\.[^.]+$/,''));buffers[title]=buf;
+        shows.forEach(function(s){if(!buffers[s.song]&&s.dur&&Math.abs(buf.duration*1000-s.dur)<1500)buffers[s.song]=buf});
+      }).catch(function(){});
+    })},Promise.resolve()).then(function(){updateRunList();var miss=missing();setMsg(m,miss.length?'warn':'good',miss.length?'Still missing: '+miss.join(', ')+'. Pick those files too.':'All songs loaded. Tap Start, then leave this page open.');var ed=q('e-pvh');if(ed&&editing)renderEditor()});
+  };
+  q('r-start').onclick=startRun;
+  q('r-stop').onclick=stopRun;
+}
+function upcoming(){var now=Date.now();return(pub?resolveStarts(pub):[]).filter(function(x){return x.end>now})}
+function missing(){return upcoming().filter(function(x){return !buffers[x.show.song]}).map(function(x){return songTitle(x.show.song)})}
+function updateRunList(){
+  var ol=q('r-list');if(!ol)return;
+  var up=upcoming();
+  ol.innerHTML=up.map(function(x,i){var ok=!!buffers[x.show.song],st=run.srcs[x.show.id];
+    return'<li>'+esc(titleOf(x.show))+' <span class="muted">'+(up[i-1]&&x.show.after===up[i-1].show.id?'right after':esc(fmtClock(x.start)))+' · '+fmtLen(x.show.dur)+'</span> '
+      +(st?'<span class="loaded">playing</span>':ok?'<span class="loaded">song loaded</span>':'<span class="muted">song not loaded</span>')+'</li>'}).join('');
+}
+function startRun(){
+  stopPreview();var c=ensureCtx();c.resume();run={armed:true,srcs:{},done:{}};
+  q('r-start').disabled=true;q('r-stop').disabled=false;
+  try{if(navigator.wakeLock)navigator.wakeLock.request('screen').then(function(w){run.wake=w}).catch(function(){})}catch(e){}
+  var m=q('r-msg');
+  (function tick(){
+    if(!run.armed)return;
+    var now=Date.now(),lat=((c.outputLatency||0)+(c.baseLatency||0))*1000,delay=LS.get('delay',0),next=null,live=false;
+    upcoming().forEach(function(x){
+      var id=x.show.id;if(run.srcs[id]||run.done[id])return;
+      var lead=x.start-delay-lat-now;
+      if(lead<1500){
+        var buf=buffers[x.show.song];run.done[id]=true;
+        if(!buf){setMsg(m,'bad',titleOf(x.show)+' started, but its song isn\'t loaded here.');return}
+        var off=lead<0?-lead/1000:0;if(off>=buf.duration)return;
+        var src=c.createBufferSource();src.buffer=buf;src.connect(c.destination);src.start(c.currentTime+Math.max(0,lead)/1000,off);
+        run.srcs[id]=src;src.onended=function(){delete run.srcs[id];updateRunList()};updateRunList();
+      }else if(!next||x.start<next.start)next=x;
+    });
+    for(var k in run.srcs)live=true;
+    if(live)setMsg(m,'good','Music playing. Keep this page open and your device unlocked.');
+    else if(next)setMsg(m,'',titleOf(next.show)+' starts in '+fmtCount(next.start-now)+'. Keep this page open and your device unlocked.');
+    else{setMsg(m,'good','The last song has finished.');stopRun(true);return}
+    setTimeout(tick,200);
+  })();
+  (function loop(){
+    if(!q('r-live'))return;
+    if(!run.armed&&!Object.keys(run.srcs).length){clearQuad('r-live','Phones will look like this');return}
+    var n=Date.now(),p=pickShow(pub?resolveStarts(pub):[],n);
+    if(p.cur)paintQuad('r-live',p.cur.show,n-p.cur.start,p.state==='live'?fmtLen(n-p.cur.start):'Starts in '+fmtCount(p.cur.start-n));
+    requestAnimationFrame(loop);
+  })();
+}
+function stopRun(keepMsg){
+  for(var k in run.srcs){try{run.srcs[k].stop()}catch(e){}}
+  if(run.wake){run.wake.release().catch(function(){})}
+  run={armed:false,srcs:{}};
+  var s1=q('r-start'),s2=q('r-stop');if(s1)s1.disabled=false;if(s2)s2.disabled=true;
+  if(keepMsg!==true)setMsg(q('r-msg'),'','Stopped.');
+  updateRunList();
+}
+
+/* ---------- start ---------- */
+fetchLibrary().catch(function(){return null}).then(function(p){
+  pub=p&&p.shows?p:null;
+  var draft=null;try{draft=JSON.parse(localStorage.getItem('draft')||'null')}catch(e){}
+  lib=draft&&draft.shows?draft:(clone(pub)||{v:3,shows:[]});
+  var pw=(pub&&pub.pw)||lib.pw;
+  if(!pw)renderGate('create');
+  else if(unlocked(pw))renderMain();
+  else renderGate('login',pw);
+});
+window.addEventListener('resize',function(){var s=editing&&showById(editing),tl=q('e-tl');if(s&&tl&&s.beats&&!preview)drawTimeline(tl,s,null)});
+})();
+</script>
+</body>
+</html>
